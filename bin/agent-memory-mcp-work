@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+export AGENT_MEMORY_VAULT="${AGENT_MEMORY_VAULT:-${HOME}/vault}"
+export AGENT_MEMORY_ROOTS="${AGENT_MEMORY_ROOTS:-${AGENT_MEMORY_VAULT}/Trabalho/Memória de Agentes}"
+export AGENT_MEMORY_NOTES="${AGENT_MEMORY_NOTES:-${AGENT_MEMORY_VAULT}/Trabalho}"
+export AGENT_MEMORY_INDEX="${AGENT_MEMORY_INDEX:-${AGENT_MEMORY_VAULT}/.agent-memory/index}"
+
+exec python3 "${SCRIPT_DIR}/../mcp_server.py"

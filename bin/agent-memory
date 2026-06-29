@@ -1,0 +1,1187 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VAULT_ROOT="${AGENT_MEMORY_VAULT:-${HOME}/vault}"
+WORK_ROOT="${AGENT_MEMORY_WORK:-${HOME}/code/work}"
+MEMORY_ROOT="${AGENT_MEMORY_ROOT:-$VAULT_ROOT/Trabalho/Memória de Agentes}"
+WORK_NOTES="${AGENT_MEMORY_NOTES:-$VAULT_ROOT/Trabalho}"
+INDEX_ROOT="${AGENT_MEMORY_INDEX:-$WORK_ROOT/.agent-memory/index}"
+SQLITE_INDEX="$INDEX_ROOT/memory.sqlite"
+
+usage() {
+  cat <<'EOF'
+agent-memory - busca barata em memória de agents
+
+Uso:
+  agent-memory index
+  agent-memory projects
+  agent-memory project <nome>
+  agent-memory demands [termo...]
+  agent-memory find <termo...>
+  agent-memory work <termo...>
+  agent-memory inbox
+  agent-memory capture <texto>
+  agent-memory status
+  agent-memory scan-projects [--missing]
+  agent-memory init-project <nome>
+  agent-memory links <projeto>
+  agent-memory show <nota>
+  agent-memory related <projeto> <termo...>
+  agent-memory build-index
+  agent-memory index-sqlite
+  agent-memory search [--files] [--json] [--project <projeto>] [--kind <tipo>] [--limit <n>] [--since YYYY-MM-DD] <termo...>
+  agent-memory summary <projeto>
+  agent-memory promote <projeto> <texto...>
+  agent-memory promote-inbox <n> <projeto>
+  agent-memory patch-all
+  agent-memory doctor [--all]
+  agent-memory review
+
+Comandos:
+  index         mostra o índice principal
+  projects      lista notas de projetos
+  project       mostra a nota de um projeto
+  demands       busca em Demandas.md
+  find          busca primeiro na memória de agents
+  work          busca em memória, notas de Trabalho e CLAUDE.md do code/work
+  inbox         mostra a inbox de memória (numerada)
+  capture       adiciona uma entrada curta na inbox para revisão posterior
+  status        mostra saúde resumida da memória
+  scan-projects lista projetos do code/work e lacunas de memória
+  init-project  cria uma nota inicial em Projetos/
+  links         lista notas relacionadas a um projeto
+  show          mostra uma nota por nome, caminho relativo ou projeto
+  related       busca termo na nota do projeto, notas linkadas e CLAUDE.md
+  build-index   gera Index.links.json a partir dos links Obsidian
+  index-sqlite  gera índice SQLite FTS5 local
+  search        busca no índice SQLite FTS5 com ranking (--kind: projeto|memoria|demanda|daily|claude|nota)
+  summary       mostra resumo operacional de uma nota de projeto
+  promote       adiciona aprendizado persistente à nota de um projeto
+  promote-inbox move item N da inbox para nota de projeto
+  patch-all     injeta bloco agent-memory no CLAUDE.md de projetos que ainda não têm
+  doctor        valida saúde da memória e índices (--all: ambos os workspaces)
+  review        mostra itens que pedem revisão periódica
+
+Variáveis:
+  AGENT_MEMORY_VAULT=/caminho/do/vault
+  AGENT_MEMORY_WORK=/caminho/do/code/work
+EOF
+}
+
+require_args() {
+  if [ "$#" -eq 0 ]; then
+    usage
+    exit 2
+  fi
+}
+
+project_dirs() {
+  fd --exact-depth 1 -t d \
+    --exclude 'bin' --exclude 'cli' \
+    --exclude '.air' --exclude '.platform' \
+    --exclude '.agent-memory' --exclude '.agents' --exclude '.codex' \
+    --exclude '.git' --exclude '.ruff_cache' --exclude '.sisyphus' \
+    --exclude 'target' --exclude 'tests' \
+    . "$WORK_ROOT" | xargs -I{} basename {} | sort
+}
+
+project_notes() {
+  find "$MEMORY_ROOT/Projetos" -maxdepth 1 -type f -name '*.md' -printf '%f\n' \
+    | sed 's/\.md$//' \
+    | sort
+}
+
+inbox_item_count() {
+  if [ ! -f "$MEMORY_ROOT/Inbox.md" ]; then
+    echo 0
+    return
+  fi
+  awk '
+    /^## [0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9]$/ { dated=1; next }
+    /^## / { dated=0; next }
+    dated && /^- / { count++ }
+    END { print count + 0 }
+  ' "$MEMORY_ROOT/Inbox.md"
+}
+
+latest_decisions() {
+  if [ ! -f "$MEMORY_ROOT/Decisões.md" ]; then
+    return
+  fi
+  rg -n '^- ' "$MEMORY_ROOT/Decisões.md" | tail -5
+}
+
+detect_build() {
+  project="$1"
+  if [ -f "$WORK_ROOT/$project/pom.xml" ]; then
+    echo "maven"
+  elif [ -f "$WORK_ROOT/$project/package.json" ]; then
+    echo "node"
+  elif [ -f "$WORK_ROOT/$project/go.mod" ]; then
+    echo "go"
+  elif [ -f "$WORK_ROOT/$project/docker-compose.yml" ]; then
+    echo "compose"
+  else
+    echo "-"
+  fi
+}
+
+print_project_scan_row() {
+  project="$1"
+  memory="não"
+  claude="não"
+  build="$(detect_build "$project")"
+  [ -f "$MEMORY_ROOT/Projetos/$project.md" ] && memory="sim"
+  [ -f "$WORK_ROOT/$project/CLAUDE.md" ] && claude="sim"
+  printf '%-40s %-12s %-12s %-12s\n' "$project" "$memory" "$claude" "$build"
+}
+
+resolve_note() {
+  query="$1"
+  if [ -f "$query" ]; then
+    realpath "$query"
+    return 0
+  fi
+  if [ -f "$VAULT_ROOT/$query" ]; then
+    realpath "$VAULT_ROOT/$query"
+    return 0
+  fi
+  if [ -f "$VAULT_ROOT/$query.md" ]; then
+    realpath "$VAULT_ROOT/$query.md"
+    return 0
+  fi
+  if [ -f "$MEMORY_ROOT/Projetos/$query.md" ]; then
+    realpath "$MEMORY_ROOT/Projetos/$query.md"
+    return 0
+  fi
+
+  matches="$(
+    fd -t f -e md -F -i "$query" "$VAULT_ROOT" | sort
+  )"
+  count="$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l)"
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' "$matches"
+    return 0
+  fi
+  if [ "$count" -gt 1 ]; then
+    echo "Mais de uma nota encontrada para: $query" >&2
+    printf '%s\n' "$matches" | sed "s#^$VAULT_ROOT/#  #" >&2
+    return 1
+  fi
+  echo "Nota não encontrada: $query" >&2
+  return 1
+}
+
+linked_note_paths() {
+  note="$1"
+  python - "$VAULT_ROOT" "$note" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1])
+note = Path(sys.argv[2])
+files = list(root.rglob("*.md"))
+by_stem = {}
+by_rel = {}
+for path in files:
+    by_stem.setdefault(path.stem, []).append(path)
+    rel = str(path.relative_to(root))[:-3]
+    by_rel[rel] = path
+
+text = note.read_text(errors="ignore")
+seen = set()
+for raw in re.findall(r"\[\[([^\]|#]+)", text):
+    name = raw.strip()
+    target = by_rel.get(name)
+    if target is None:
+      matches = by_stem.get(Path(name).name, [])
+      target = matches[0] if len(matches) == 1 else None
+    if target and target not in seen:
+        seen.add(target)
+        print(target)
+PY
+}
+
+build_links_index() {
+  mkdir -p "$INDEX_ROOT"
+  python - "$VAULT_ROOT" "$INDEX_ROOT/Index.links.json" <<'PY'
+from pathlib import Path
+import json
+import re
+import sys
+
+root = Path(sys.argv[1])
+out = Path(sys.argv[2])
+items = []
+skip_parts = {
+    ".git",
+    ".obsidian",
+    ".opencode",
+    ".trash",
+    "node_modules",
+}
+for path in sorted(root.rglob("*.md")):
+    if any(part in skip_parts for part in path.relative_to(root).parts):
+        continue
+    rel = str(path.relative_to(root))
+    text = path.read_text(errors="ignore")
+    links = []
+    for raw in re.findall(r"\[\[([^\]|#]+)", text):
+        name = raw.strip()
+        if name not in links:
+            links.append(name)
+    items.append({
+        "path": rel,
+        "name": path.stem,
+        "links": links,
+    })
+out.write_text(json.dumps(items, ensure_ascii=False, indent=2) + "\n")
+print(out)
+PY
+}
+
+build_sqlite_index() {
+  mkdir -p "$INDEX_ROOT"
+  python - "$VAULT_ROOT" "$WORK_ROOT" "$SQLITE_INDEX" "$MEMORY_ROOT" <<'PY'
+from pathlib import Path
+import os
+import re
+import sqlite3
+import sys
+
+vault = Path(sys.argv[1])
+work = Path(sys.argv[2])
+db_path = Path(sys.argv[3])
+memory = Path(sys.argv[4])
+
+skip_parts = {".git", ".obsidian", ".opencode", ".trash", "node_modules", ".index"}
+
+def should_skip(path: Path, root: Path) -> bool:
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return False
+    return any(part in skip_parts for part in rel.parts)
+
+def classify(path: Path) -> tuple[str, str]:
+    s = str(path)
+    name = path.stem
+    project = ""
+    kind = "nota"
+
+    projetos_dir = str(memory / "Projetos")
+    memory_str = str(memory)
+
+    if s.startswith(projetos_dir + "/") and path.suffix == ".md":
+        kind = "projeto"
+        project = name
+    elif s == str(memory / "Demandas.md"):
+        kind = "indice-demandas"
+    elif "/Trabalho/Air/Demandas/" in s or "/Trabalho/Bug " in s or "/Trabalho/GMUD " in s:
+        kind = "demanda"
+    elif s.startswith(memory_str + "/"):
+        kind = "memoria"
+    elif "/Daily Notes/" in s:
+        kind = "daily"
+    elif path.name == "CLAUDE.md":
+        kind = "claude"
+        try:
+            if path.parent != work:
+                project = path.parent.name
+        except Exception:
+            pass
+    elif path.name in {"AGENTS.md", "GEMINI.md"}:
+        kind = "agent-instructions"
+    return kind, project
+
+def title_for(path: Path, text: str) -> str:
+    for line in text.splitlines():
+        if line.startswith("# "):
+            return line[2:].strip()
+    return path.stem
+
+MAX_CHUNK = 1500
+
+def _split_paragraphs(heading: str, text: str):
+    """Split text > MAX_CHUNK chars into paragraph-sized sub-chunks."""
+    if len(text) <= MAX_CHUNK:
+        yield heading, text
+        return
+    # First split by blank lines
+    paragraphs = re.split(r"\n{2,}", text)
+    buf = []
+    buf_len = 0
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        # Para still too large (e.g. transcript with no blank lines) → split by line
+        if len(para) > MAX_CHUNK:
+            if buf:
+                yield heading, "\n\n".join(buf)
+                buf = []
+                buf_len = 0
+            lines = para.splitlines()
+            line_buf = []
+            line_len = 0
+            for line in lines:
+                # Single line exceeds MAX_CHUNK — split by character count
+                if len(line) > MAX_CHUNK:
+                    if line_buf:
+                        yield heading, "\n".join(line_buf)
+                        line_buf = []
+                        line_len = 0
+                    for start in range(0, len(line), MAX_CHUNK):
+                        yield heading, line[start:start + MAX_CHUNK]
+                    continue
+                if line_len + len(line) > MAX_CHUNK and line_buf:
+                    yield heading, "\n".join(line_buf)
+                    line_buf = []
+                    line_len = 0
+                line_buf.append(line)
+                line_len += len(line)
+            if line_buf:
+                yield heading, "\n".join(line_buf)
+            continue
+        if buf_len + len(para) > MAX_CHUNK and buf:
+            yield heading, "\n\n".join(buf)
+            buf = []
+            buf_len = 0
+        buf.append(para)
+        buf_len += len(para)
+    if buf:
+        yield heading, "\n\n".join(buf)
+
+def chunks_for(text: str):
+    heading = ""
+    buf = []
+    for line in text.splitlines():
+        if line.startswith("#"):
+            if buf:
+                raw = "\n".join(buf).strip()
+                yield from _split_paragraphs(heading, raw)
+                buf = []
+            heading = line.lstrip("#").strip()
+        else:
+            buf.append(line)
+    if buf:
+        raw = "\n".join(buf).strip()
+        yield from _split_paragraphs(heading, raw)
+
+sources = []
+for root in (vault, work):
+    if not root.exists():
+        continue
+    for path in root.rglob("*.md"):
+        if should_skip(path, root):
+            continue
+        if root == work and path.name != "CLAUDE.md" and path.parent == work:
+            if path.name not in {"AGENTS.md", "GEMINI.md"}:
+                continue
+        if root == work and path.name != "CLAUDE.md" and path.name not in {"AGENTS.md", "GEMINI.md"}:
+            continue
+        sources.append(path)
+
+def parse_note_date(path: Path) -> int:
+    import re as _re
+    from datetime import datetime
+    m = _re.match(r'^(\d{2})-(\d{2})-(\d{4})$', path.stem)
+    if m:
+        dd, mm, yyyy = m.groups()
+        try:
+            return int(datetime(int(yyyy), int(mm), int(dd)).timestamp())
+        except ValueError:
+            pass
+    return 0
+
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+cur.executescript("""
+DROP TABLE IF EXISTS chunks_fts;
+DROP TABLE IF EXISTS chunks;
+DROP TABLE IF EXISTS links;
+DROP TABLE IF EXISTS documents;
+
+CREATE TABLE documents (
+  id INTEGER PRIMARY KEY,
+  path TEXT UNIQUE NOT NULL,
+  title TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  project TEXT NOT NULL,
+  mtime INTEGER NOT NULL,
+  note_date INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE links (
+  source_path TEXT NOT NULL,
+  target_path TEXT NOT NULL
+);
+CREATE INDEX links_source ON links(source_path);
+
+CREATE TABLE chunks (
+  id INTEGER PRIMARY KEY,
+  document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  heading TEXT NOT NULL,
+  content TEXT NOT NULL
+);
+
+CREATE VIRTUAL TABLE chunks_fts USING fts5(
+  title,
+  kind,
+  project,
+  heading,
+  content,
+  tokenize="unicode61 remove_diacritics 2"
+);
+""")
+
+vault_files = list(vault.rglob("*.md"))
+by_stem: dict = {}
+by_rel: dict = {}
+for vf in vault_files:
+    by_stem.setdefault(vf.stem, []).append(vf)
+    by_rel[str(vf.relative_to(vault))[:-3]] = vf
+
+doc_count = 0
+chunk_count = 0
+path_to_rel: dict = {}
+for path in sorted(set(sources)):
+    try:
+        text = path.read_text(errors="ignore")
+    except Exception:
+        continue
+    if not text.strip():
+        continue
+    kind, project = classify(path)
+    title = title_for(path, text)
+    note_date = parse_note_date(path) if kind == "daily" else 0
+    try:
+        if path.is_relative_to(vault):
+            rel = str(path.relative_to(vault))
+        elif path.is_relative_to(work):
+            rel = str(Path("~") / "code" / work.name / path.relative_to(work))
+        else:
+            rel = str(path)
+    except AttributeError:
+        rel = str(path)
+    path_to_rel[path] = rel
+    cur.execute(
+        "INSERT INTO documents(path,title,kind,project,mtime,note_date) VALUES (?,?,?,?,?,?)",
+        (rel, title, kind, project, int(path.stat().st_mtime), note_date),
+    )
+    doc_id = cur.lastrowid
+    doc_count += 1
+    inserted_chunk = False
+    for heading, content in chunks_for(text):
+        if not content:
+            continue
+        cur.execute(
+            "INSERT INTO chunks(document_id,heading,content) VALUES (?,?,?)",
+            (doc_id, heading, content),
+        )
+        chunk_id = cur.lastrowid
+        cur.execute(
+            "INSERT INTO chunks_fts(rowid,title,kind,project,heading,content) VALUES (?,?,?,?,?,?)",
+            (chunk_id, title, kind, project, heading, content),
+        )
+        chunk_count += 1
+        inserted_chunk = True
+    if not inserted_chunk:
+        cur.execute(
+            "INSERT INTO chunks(document_id,heading,content) VALUES (?,?,?)",
+            (doc_id, title, text),
+        )
+        chunk_id = cur.lastrowid
+        cur.execute(
+            "INSERT INTO chunks_fts(rowid,title,kind,project,heading,content) VALUES (?,?,?,?,?,?)",
+            (chunk_id, title, kind, project, title, text),
+        )
+        chunk_count += 1
+
+link_count = 0
+for path, rel in path_to_rel.items():
+    if not path.is_relative_to(vault):
+        continue
+    try:
+        text = path.read_text(errors="ignore")
+    except Exception:
+        continue
+    for raw in re.findall(r"\[\[([^\]|#]+)", text):
+        name = raw.strip()
+        target = by_rel.get(name)
+        if target is None:
+            matches = by_stem.get(Path(name).name, [])
+            target = matches[0] if len(matches) == 1 else None
+        if target:
+            target_rel = str(target.relative_to(vault))
+            cur.execute("INSERT INTO links(source_path,target_path) VALUES (?,?)", (rel, target_rel))
+            link_count += 1
+
+conn.commit()
+conn.close()
+print(f"{db_path}")
+print(f"documents={doc_count} chunks={chunk_count} links={link_count}")
+PY
+}
+
+search_sqlite_index() {
+  project=""
+  kind=""
+  limit="10"
+  output="text"
+  since=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --files)
+        output="files"
+        ;;
+      --json)
+        output="json"
+        ;;
+      --project)
+        shift
+        require_args "$@"
+        project="$1"
+        ;;
+      --kind)
+        shift
+        require_args "$@"
+        kind="$1"
+        ;;
+      --limit)
+        shift
+        require_args "$@"
+        limit="$1"
+        ;;
+      --since)
+        shift
+        require_args "$@"
+        since="$(date -d "$1" +%s 2>/dev/null || date -j -f '%Y-%m-%d' "$1" +%s 2>/dev/null || echo '')"
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        break
+        ;;
+    esac
+    shift
+  done
+  require_args "$@"
+  query="$*"
+  if [ ! -f "$SQLITE_INDEX" ]; then
+    echo "Índice SQLite não encontrado. Rode: agent-memory index-sqlite" >&2
+    exit 1
+  fi
+  python - "$SQLITE_INDEX" "$query" "$project" "$kind" "$limit" "$VAULT_ROOT" "$WORK_ROOT" "$MEMORY_ROOT" "$output" "$since" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+import re
+import json
+
+db_path, query, project, kind, limit = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
+vault = Path(sys.argv[6])
+work = Path(sys.argv[7])
+memory = Path(sys.argv[8])
+output = sys.argv[9]
+since = int(sys.argv[10]) if sys.argv[10] else 0
+
+def fts_query(q: str) -> str:
+    terms = [t.strip().replace('"', '') for t in q.split() if t.strip()]
+    return " OR ".join(f'"{t}"' for t in terms) if terms else q
+
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+where = ["chunks_fts MATCH ?"]
+params = [fts_query(query)]
+if project:
+    allowed = set()
+    project_note = memory / "Projetos" / f"{project}.md"
+    if project_note.exists():
+        project_note_rel = str(project_note.relative_to(vault))
+        allowed.add(project_note_rel)
+        for (target_path,) in cur.execute(
+            "SELECT target_path FROM links WHERE source_path = ?", (project_note_rel,)
+        ).fetchall():
+            allowed.add(target_path)
+    claude = work / project / "CLAUDE.md"
+    if claude.exists():
+        allowed.add(str(Path("~") / "code" / work.name / project / "CLAUDE.md"))
+    if allowed:
+        placeholders = ",".join("?" for _ in allowed)
+        where.append(f"(documents.project = ? OR documents.path IN ({placeholders}))")
+        params.append(project)
+        params.extend(sorted(allowed))
+    else:
+        where.append("documents.project = ?")
+        params.append(project)
+if kind:
+    where.append("documents.kind = ?")
+    params.append(kind)
+if since:
+    where.append("COALESCE(NULLIF(documents.note_date,0), documents.mtime) >= ?")
+    params.append(since)
+params.append(limit)
+
+sql = f"""
+SELECT
+  documents.path,
+  documents.title,
+  documents.kind,
+  documents.project,
+  chunks.heading,
+  snippet(chunks_fts, 4, '[', ']', ' ... ', 24) AS snippet,
+  bm25(chunks_fts) AS rank
+FROM chunks_fts
+JOIN chunks ON chunks_fts.rowid = chunks.id
+JOIN documents ON documents.id = chunks.document_id
+WHERE {' AND '.join(where)}
+ORDER BY rank
+LIMIT ?
+"""
+rows = cur.execute(sql, params).fetchall()
+if not rows:
+    sys.exit(1)
+if output == "json":
+    print(json.dumps([
+        {
+            "path": path,
+            "title": title,
+            "kind": kind,
+            "project": project,
+            "heading": heading,
+            "snippet": snippet,
+            "rank": rank,
+        }
+        for path, title, kind, project, heading, snippet, rank in rows
+    ], ensure_ascii=False, indent=2))
+    conn.close()
+    raise SystemExit(0)
+if output == "files":
+    seen = set()
+    for path, title, kind, project, heading, snippet, rank in rows:
+        if path in seen:
+            continue
+        seen.add(path)
+        meta = kind if not project else f"{kind}/{project}"
+        print(f"{path}\t{title}\t{meta}")
+    conn.close()
+    raise SystemExit(0)
+for i, (path, title, kind, project, heading, snippet, rank) in enumerate(rows, 1):
+    meta = kind
+    if project:
+        meta += f"/{project}"
+    print(f"{i}. {path}")
+    print(f"   {title} | {meta} | {heading}")
+    print(f"   {snippet}")
+conn.close()
+PY
+}
+
+summary_project() {
+  require_args "$@"
+  project="$1"
+  project_file="$MEMORY_ROOT/Projetos/$project.md"
+  if [ ! -f "$project_file" ]; then
+    project_file="$(resolve_note "$project")"
+  fi
+  python - "$project_file" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+sections = {
+    "Contexto útil",
+    "Comandos",
+    "Demandas relacionadas",
+    "Aprendizados persistentes",
+    "Aliases",
+    "Cuidados",
+}
+current = None
+buf = []
+print(path.read_text(errors="ignore").splitlines()[0])
+print()
+for line in path.read_text(errors="ignore").splitlines()[1:]:
+    if line.startswith("## "):
+        heading = line[3:].strip()
+        current = heading if heading in sections else None
+        if current:
+            print(line)
+        continue
+    if current:
+        print(line)
+PY
+}
+
+doctor_memory() {
+  python - "$VAULT_ROOT" "$WORK_ROOT" "$MEMORY_ROOT" "$SQLITE_INDEX" <<'PY'
+from pathlib import Path
+import json
+import re
+import sqlite3
+import sys
+
+vault = Path(sys.argv[1])
+work = Path(sys.argv[2])
+memory = Path(sys.argv[3])
+sqlite_index = Path(sys.argv[4])
+
+issues = 0
+
+def report(kind, message):
+    global issues
+    issues += 1
+    print(f"[{kind}] {message}")
+
+print("Doctor de memória")
+print()
+
+projects = sorted([
+    p.name for p in work.iterdir()
+    if p.is_dir() and p.name not in {"bin", "cli", ".air", ".platform", ".agent-memory", ".agents", ".codex", ".git", ".ruff_cache", ".sisyphus", "target", "tests"}
+]) if work.exists() else []
+
+for project in projects:
+    if not (memory / "Projetos" / f"{project}.md").exists():
+        report("missing-project-note", project)
+    if not (work / project / "CLAUDE.md").exists():
+        report("missing-claude", project)
+
+index_json = Path(sys.argv[4]).parent / "Index.links.json"
+if not index_json.exists():
+    report("missing-index-json", str(index_json))
+
+if not sqlite_index.exists():
+    report("missing-sqlite-index", str(sqlite_index))
+else:
+    newest_md = 0
+    for root in (vault, work):
+        if not root.exists():
+            continue
+        for path in root.rglob("*.md"):
+            if any(part in {".git", ".obsidian", ".opencode", ".trash", "node_modules", ".index"} for part in path.parts):
+                continue
+            newest_md = max(newest_md, int(path.stat().st_mtime))
+    if int(sqlite_index.stat().st_mtime) < newest_md:
+        report("stale-sqlite-index", "rode `bin/agent-memory index-sqlite`")
+    try:
+        conn = sqlite3.connect(sqlite_index)
+        doc_count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        chunk_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        conn.close()
+        print(f"SQLite: documents={doc_count} chunks={chunk_count}")
+    except Exception as exc:
+        report("sqlite-error", str(exc))
+
+files = [p for p in vault.rglob("*.md") if not any(part in {".git", ".obsidian", ".opencode", ".trash", "node_modules", ".index"} for part in p.relative_to(vault).parts)]
+by_stem = {}
+by_rel = {}
+for path in files:
+    by_stem.setdefault(path.stem, []).append(path)
+    by_rel[str(path.relative_to(vault))[:-3]] = path
+
+for path in memory.rglob("*.md"):
+    rel = path.relative_to(memory)
+    text = path.read_text(errors="ignore")
+    for raw in re.findall(r"\[\[([^\]|#]+)", text):
+        name = raw.strip()
+        if "{{" in name or name in {"Nome da Nota", "note name"}:
+            continue
+        target = by_rel.get(name)
+        if target is None:
+            matches = by_stem.get(Path(name).name, [])
+            target = matches[0] if len(matches) == 1 else None
+            if len(matches) > 1:
+                target = matches[0]
+        if target is None:
+            report("broken-link", f"{rel} -> {name}")
+
+for path in memory.rglob("*.md"):
+    if "Templates" in path.relative_to(memory).parts:
+        continue
+    text = path.read_text(errors="ignore")
+    if "{{" in text or "note name" in text:
+        report("placeholder", str(path.relative_to(memory)))
+
+if issues == 0:
+    print("OK: sem problemas encontrados")
+else:
+    print()
+    print(f"Problemas encontrados: {issues}")
+    raise SystemExit(1)
+PY
+}
+
+cmd="${1:-}"
+if [ -z "$cmd" ]; then
+  usage
+  exit 2
+fi
+shift || true
+
+case "$cmd" in
+  index)
+    sed -n '1,220p' "$MEMORY_ROOT/Index.md"
+    ;;
+  projects)
+    find "$MEMORY_ROOT/Projetos" -maxdepth 1 -type f -name '*.md' -printf '%f\n' | sort
+    ;;
+  project)
+    require_args "$@"
+    project="$1"
+    file="$MEMORY_ROOT/Projetos/$project.md"
+    if [ ! -f "$file" ]; then
+      echo "Projeto não encontrado: $project" >&2
+      echo "Projetos disponíveis:" >&2
+      find "$MEMORY_ROOT/Projetos" -maxdepth 1 -type f -name '*.md' -printf '  %f\n' | sort >&2
+      exit 1
+    fi
+    sed -n '1,220p' "$file"
+    ;;
+  demands)
+    if [ "$#" -eq 0 ]; then
+      sed -n '1,240p' "$MEMORY_ROOT/Demandas.md"
+    else
+      rg -n -i "$*" "$MEMORY_ROOT/Demandas.md"
+    fi
+    ;;
+  find)
+    require_args "$@"
+    rg -n -i "$*" "$MEMORY_ROOT"
+    ;;
+  work)
+    require_args "$@"
+    rg -n -i "$*" \
+      "$MEMORY_ROOT" \
+      "$WORK_NOTES" \
+      "$WORK_ROOT/CLAUDE.md" \
+      "$WORK_ROOT/GEMINI.md" \
+      "$WORK_ROOT/AGENTS.md" \
+      "$WORK_ROOT"/*/CLAUDE.md
+    ;;
+  inbox)
+    if [ ! -f "$MEMORY_ROOT/Inbox.md" ]; then
+      echo "Inbox vazia."
+    else
+      awk '
+        /^## [0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9]$/ { section=$0; next }
+        /^- / { n++; printf "%d\t%s\t%s\n", n, section, substr($0,3); next }
+        { print }
+      ' "$MEMORY_ROOT/Inbox.md" | head -260
+    fi
+    ;;
+  capture)
+    require_args "$@"
+    today="$(date +%d-%m-%Y)"
+    timestamp="$(date '+%d-%m-%Y %H:%M:%S')"
+    if ! rg -q "^## $today$" "$MEMORY_ROOT/Inbox.md"; then
+      {
+        printf '\n## %s\n\n' "$today"
+      } >> "$MEMORY_ROOT/Inbox.md"
+    fi
+    {
+      printf -- '- %s - %s\n' "$timestamp" "$*"
+    } >> "$MEMORY_ROOT/Inbox.md"
+    echo "Entrada adicionada em $MEMORY_ROOT/Inbox.md"
+    ;;
+  status)
+    memory_files="$(find "$MEMORY_ROOT" -type f -name '*.md' | wc -l)"
+    note_count="$(project_notes | wc -l)"
+    dir_count="$(project_dirs | wc -l)"
+    claude_count="$(find "$WORK_ROOT" -mindepth 2 -maxdepth 2 -name 'CLAUDE.md' | wc -l)"
+    inbox_count="$(inbox_item_count)"
+
+    echo "Memória de agents"
+    echo
+    echo "Vault: $VAULT_ROOT"
+    echo "Workspace: $WORK_ROOT"
+    echo
+    echo "Arquivos Markdown na memória: $memory_files"
+    echo "Notas de projeto: $note_count"
+    echo "Projetos detectados no workspace: $dir_count"
+    echo "Projetos com CLAUDE.md local: $claude_count"
+    echo "Itens na inbox: $inbox_count"
+    echo
+    echo "Projetos do workspace sem nota de memória:"
+    missing_any=false
+    while IFS= read -r project; do
+      if [ ! -f "$MEMORY_ROOT/Projetos/$project.md" ]; then
+        echo "- $project"
+        missing_any=true
+      fi
+    done < <(project_dirs)
+    if [ "$missing_any" = false ]; then
+      echo "- nenhum"
+    fi
+    echo
+    echo "Notas de memória sem diretório no workspace:"
+    orphan_any=false
+    while IFS= read -r project; do
+      if [ ! -d "$WORK_ROOT/$project" ] && [ "$project" != "mcp-gateway" ]; then
+        echo "- $project"
+        orphan_any=true
+      fi
+    done < <(project_notes)
+    if [ "$orphan_any" = false ]; then
+      echo "- nenhuma"
+    fi
+    echo
+    echo "Últimas decisões:"
+    latest_decisions || true
+    ;;
+  scan-projects)
+    only_missing=false
+    if [ "${1:-}" = "--missing" ]; then
+      only_missing=true
+    fi
+    printf '%-40s %-12s %-12s %-12s\n' "Projeto" "Memória" "CLAUDE.md" "Build"
+    printf '%-40s %-12s %-12s %-12s\n' "-------" "-------" "---------" "-----"
+    while IFS= read -r project; do
+      if [ "$only_missing" = true ] && [ -f "$MEMORY_ROOT/Projetos/$project.md" ]; then
+        continue
+      fi
+      print_project_scan_row "$project"
+    done < <(project_dirs)
+    ;;
+  init-project)
+    require_args "$@"
+    project="$1"
+    project_dir="$WORK_ROOT/$project"
+    project_file="$MEMORY_ROOT/Projetos/$project.md"
+    if [ ! -d "$project_dir" ]; then
+      echo "Diretório de projeto não encontrado: $project_dir" >&2
+      exit 1
+    fi
+    if [ -f "$project_file" ]; then
+      echo "Nota já existe: $project_file" >&2
+      exit 1
+    fi
+    build="$(detect_build "$project")"
+    {
+      printf '# %s\n\n' "$project"
+      printf '## Fonte principal\n\n'
+      if [ -f "$project_dir/CLAUDE.md" ]; then
+        printf -- '- `%s/CLAUDE.md`\n' "$project_dir"
+      else
+        printf -- '- `%s`\n' "$project_dir"
+      fi
+      printf '\n## Contexto útil\n\n'
+      printf -- '- Projeto detectado no workspace configurado.\n'
+      printf -- '- Build detectado: `%s`.\n' "$build"
+      printf -- '- Consulte arquivos locais antes de assumir domínio ou comandos específicos.\n'
+      printf '\n## Comandos\n\n'
+      if [ "$build" = "maven" ]; then
+        printf '```bash\ncd "$WORK_ROOT/%s"\nmvn test\n```\n' "$project"
+      elif [ "$build" = "node" ]; then
+        printf '```bash\ncd "$WORK_ROOT/%s"\nnpm run dev\n```\n' "$project"
+      else
+        printf '```bash\ncd "$WORK_ROOT/%s"\n```\n' "$project"
+      fi
+      printf '\n## Demandas relacionadas\n\n- \n'
+      printf '\n## Aprendizados persistentes\n\n- \n'
+    } > "$project_file"
+    echo "Nota criada: $project_file"
+    if [ -f "$WORK_ROOT/$project/CLAUDE.md" ]; then
+      if ! rg -q 'agent-memory' "$WORK_ROOT/$project/CLAUDE.md"; then
+        printf '\n## Memória de agents\n\nContexto e decisões: `agent-memory summary %s`\nBusca: `agent-memory search --project %s <termo>`\nCaptura: `agent-memory promote %s <aprendizado>`\n' \
+          "$project" "$project" "$project" >> "$WORK_ROOT/$project/CLAUDE.md"
+        echo "Bloco agent-memory adicionado em $WORK_ROOT/$project/CLAUDE.md"
+      fi
+    fi
+    ;;
+  links)
+    require_args "$@"
+    project="$1"
+    project_file="$MEMORY_ROOT/Projetos/$project.md"
+    if [ ! -f "$project_file" ]; then
+      project_file="$(resolve_note "$project")"
+    fi
+    echo "Nota base:"
+    echo "- ${project_file#$VAULT_ROOT/}"
+    echo
+    echo "Notas relacionadas:"
+    linked_any=false
+    while IFS= read -r linked; do
+      [ -z "$linked" ] && continue
+      echo "- ${linked#$VAULT_ROOT/}"
+      linked_any=true
+    done < <(linked_note_paths "$project_file")
+    if [ "$linked_any" = false ]; then
+      echo "- nenhuma"
+    fi
+    echo
+    if [ -f "$WORK_ROOT/$project/CLAUDE.md" ]; then
+      echo "Contexto local:"
+      echo "- $WORK_ROOT/$project/CLAUDE.md"
+    fi
+    ;;
+  show)
+    require_args "$@"
+    note="$(resolve_note "$*")"
+    sed -n '1,260p' "$note"
+    ;;
+  related)
+    if [ "$#" -lt 2 ]; then
+      usage
+      exit 2
+    fi
+    project="$1"
+    shift
+    term="$*"
+    project_file="$MEMORY_ROOT/Projetos/$project.md"
+    if [ ! -f "$project_file" ]; then
+      project_file="$(resolve_note "$project")"
+    fi
+    tmp_file="$(mktemp)"
+    trap 'rm -f "$tmp_file"' EXIT
+    {
+      echo "$project_file"
+      linked_note_paths "$project_file"
+      [ -f "$MEMORY_ROOT/Demandas.md" ] && echo "$MEMORY_ROOT/Demandas.md"
+      [ -f "$WORK_ROOT/$project/CLAUDE.md" ] && echo "$WORK_ROOT/$project/CLAUDE.md"
+      [ -f "$WORK_ROOT/CLAUDE.md" ] && echo "$WORK_ROOT/CLAUDE.md"
+      [ -f "$WORK_ROOT/AGENTS.md" ] && echo "$WORK_ROOT/AGENTS.md"
+    } | awk 'NF && !seen[$0]++' > "$tmp_file"
+    while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      rg -n -i --with-filename "$term" "$f" || true
+    done < "$tmp_file"
+    ;;
+  build-index)
+    build_links_index
+    ;;
+  index-sqlite)
+    mkdir -p "$INDEX_ROOT"
+    python3 "$(dirname "$0")/../agent_memory_indexer.py" "$@"
+    ;;
+  search)
+    search_sqlite_index "$@"
+    ;;
+  summary)
+    summary_project "$@"
+    ;;
+  promote)
+    if [ "$#" -lt 2 ]; then
+      usage
+      exit 2
+    fi
+    project="$1"
+    shift
+    text="$*"
+    project_file="$MEMORY_ROOT/Projetos/$project.md"
+    if [ ! -f "$project_file" ]; then
+      echo "Projeto não encontrado: $project" >&2
+      exit 1
+    fi
+    if rg -q '^## Aprendizados persistentes' "$project_file"; then
+      awk -v text="- $text" '
+        /^## Aprendizados persistentes/ { print; found=1; next }
+        found && /^## / { print text; print ""; found=0 }
+        found && /^- $/ { print text; found=0; next }
+        { print }
+        END { if (found) print text }
+      ' "$project_file" > "${project_file}.tmp" && mv "${project_file}.tmp" "$project_file"
+    else
+      printf '\n## Aprendizados persistentes\n\n- %s\n' "$text" >> "$project_file"
+    fi
+    echo "Adicionado em $project_file"
+    ;;
+  promote-inbox)
+    if [ "$#" -lt 2 ]; then
+      usage
+      exit 2
+    fi
+    n="$1"
+    project="$2"
+    project_file="$MEMORY_ROOT/Projetos/$project.md"
+    if [ ! -f "$MEMORY_ROOT/Inbox.md" ]; then
+      echo "Inbox não encontrada." >&2
+      exit 1
+    fi
+    if [ ! -f "$project_file" ]; then
+      echo "Projeto não encontrado: $project" >&2
+      exit 1
+    fi
+    item="$(awk -v target="$n" '
+      /^- / { count++; if (count == target) { print substr($0,3); exit } }
+    ' "$MEMORY_ROOT/Inbox.md")"
+    if [ -z "$item" ]; then
+      echo "Item $n não encontrado na inbox." >&2
+      exit 1
+    fi
+    awk -v target="$n" '
+      /^- / { count++; if (count == target) next }
+      { print }
+    ' "$MEMORY_ROOT/Inbox.md" > "$MEMORY_ROOT/Inbox.md.tmp" && mv "$MEMORY_ROOT/Inbox.md.tmp" "$MEMORY_ROOT/Inbox.md"
+    if rg -q '^## Aprendizados persistentes' "$project_file"; then
+      awk -v text="- $item" '
+        /^## Aprendizados persistentes/ { print; found=1; next }
+        found && /^## / { print text; print ""; found=0 }
+        found && /^- $/ { print text; found=0; next }
+        { print }
+        END { if (found) print text }
+      ' "$project_file" > "${project_file}.tmp" && mv "${project_file}.tmp" "$project_file"
+    else
+      printf '\n## Aprendizados persistentes\n\n- %s\n' "$item" >> "$project_file"
+    fi
+    echo "Movido inbox[$n] → $project_file"
+    ;;
+  patch-all)
+    patched=0
+    skipped=0
+    while IFS= read -r project; do
+      claude_file="$WORK_ROOT/$project/CLAUDE.md"
+      [ ! -f "$claude_file" ] && { skipped=$((skipped+1)); continue; }
+      if rg -q 'agent-memory' "$claude_file"; then
+        skipped=$((skipped+1))
+        continue
+      fi
+      printf '\n## Memória de agents\n\nContexto e decisões: `agent-memory summary %s`\nBusca: `agent-memory search --project %s <termo>`\nCaptura: `agent-memory promote %s <aprendizado>`\n' \
+        "$project" "$project" "$project" >> "$claude_file"
+      echo "Patched: $claude_file"
+      patched=$((patched+1))
+    done < <(project_dirs)
+    echo "Patched: $patched  Skipped: $skipped"
+    ;;
+  doctor)
+    if [ "${1:-}" = "--all" ]; then
+      personal_bin="${HOME}/code/personal/bin/agent-memory"
+      work_bin="${HOME}/code/work/bin/agent-memory"
+      echo "=== Personal ==="
+      if [ -x "$personal_bin" ]; then "$personal_bin" doctor; else echo "wrapper não encontrado: $personal_bin"; fi
+      echo
+      echo "=== Work ==="
+      if [ -x "$work_bin" ]; then "$work_bin" doctor; else echo "wrapper não encontrado: $work_bin"; fi
+    else
+      doctor_memory
+    fi
+    ;;
+  review)
+    echo "Revisão de memória"
+    echo
+    echo "1. Inbox"
+    if [ -f "$MEMORY_ROOT/Inbox.md" ]; then
+      "$0" inbox
+    else
+      echo "(sem inbox)"
+    fi
+    echo
+    echo "2. Projetos sem nota"
+    "$0" scan-projects --missing
+    echo
+    echo "3. Status"
+    "$0" status
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    echo "Comando desconhecido: $cmd" >&2
+    usage
+    exit 2
+    ;;
+esac

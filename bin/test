@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CLI="$ROOT/bin/agent-memory"
+
+bash -n "$CLI"
+"$CLI" status >/dev/null
+"$CLI" summary comercial-api >/dev/null
+"$CLI" search --limit 1 MySqlRepository >/dev/null
+"$CLI" doctor >/dev/null
+
+echo "ok"

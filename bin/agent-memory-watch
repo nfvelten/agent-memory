@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""
+Vault watcher — reindexes changed .md files automatically via inotify.
+Runs as a daemon; use systemd service agent-memory-watch.service.
+"""
+import logging
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from watchdog.events import FileSystemEvent, FileSystemEventHandler
+from watchdog.observers.inotify import InotifyObserver
+
+VAULT = Path(os.environ.get("AGENT_MEMORY_VAULT", Path.home() / "vault"))
+_works_env = os.environ.get("AGENT_MEMORY_WORKS", "")
+WORK_DIRS = [Path(p) for p in _works_env.split(":") if p] if _works_env else []
+INDEXER = Path(__file__).parent.parent / "agent_memory_indexer.py"
+
+SKIP_DIRS = {".git", ".obsidian", ".trash", "node_modules", ".index", ".opencode"}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("agent-memory-watch")
+
+
+def _run_indexer(*args: str) -> None:
+    env = os.environ.copy()
+    try:
+        result = subprocess.run(
+            [sys.executable, str(INDEXER), *args],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+        if result.stdout.strip():
+            log.info(result.stdout.strip())
+        if result.returncode != 0 and result.stderr.strip():
+            log.warning(result.stderr.strip())
+    except subprocess.TimeoutExpired:
+        log.warning("indexer timed out")
+    except Exception as e:
+        log.error("indexer error: %s", e)
+
+
+class VaultHandler(FileSystemEventHandler):
+    def _should_handle(self, path: str) -> bool:
+        p = Path(path)
+        if not path.endswith(".md"):
+            return False
+        for part in p.parts:
+            if part in SKIP_DIRS:
+                return False
+        return True
+
+    def on_created(self, event: FileSystemEvent) -> None:
+        if not event.is_directory and self._should_handle(event.src_path):
+            log.info("created: %s", event.src_path)
+            _run_indexer("--file", event.src_path)
+
+    def on_modified(self, event: FileSystemEvent) -> None:
+        if not event.is_directory and self._should_handle(event.src_path):
+            log.info("modified: %s", event.src_path)
+            _run_indexer("--file", event.src_path)
+
+    def on_deleted(self, event: FileSystemEvent) -> None:
+        if not event.is_directory and self._should_handle(event.src_path):
+            log.info("deleted: %s", event.src_path)
+            _run_indexer("--remove", event.src_path)
+
+    def on_moved(self, event: FileSystemEvent) -> None:
+        if not event.is_directory:
+            if self._should_handle(event.src_path):
+                log.info("moved from: %s", event.src_path)
+                _run_indexer("--remove", event.src_path)
+            if self._should_handle(event.dest_path):
+                log.info("moved to: %s", event.dest_path)
+                _run_indexer("--file", event.dest_path)
+
+
+def main() -> None:
+    log.info("starting vault watcher: %s", VAULT)
+
+    # Initial incremental sync on startup
+    log.info("running startup sync...")
+    _run_indexer()
+
+    handler = VaultHandler()
+    observer = InotifyObserver()
+    observer.schedule(handler, str(VAULT), recursive=True)
+
+    # Also watch CLAUDE.md files in work repos
+    for work in WORK_DIRS:
+        if not work.exists():
+            continue
+        for proj_dir in work.iterdir():
+            if proj_dir.is_dir() and not proj_dir.name.startswith("."):
+                for fname in ("CLAUDE.md", "AGENTS.md"):
+                    if (proj_dir / fname).exists():
+                        observer.schedule(handler, str(proj_dir), recursive=False)
+                        break
+
+    observer.start()
+    log.info("watching %s (inotify)", VAULT)
+    try:
+        while True:
+            time.sleep(1)
+            if not observer.is_alive():
+                log.error("observer died, restarting")
+                observer.start()
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
+
+
+if __name__ == "__main__":
+    main()
